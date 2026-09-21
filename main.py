@@ -1,13 +1,14 @@
 """
-VAX PlaneSim — Step 2
-Environment, circling fighter, lock-on box, and predicted velocity vector.
+VAX PlaneSim — Step 3
+Environment, lock-on box, predicted vector, and camera POV modes.
 
 Python 3.12 recommended (Panda3D wheels):
     py -3.12 -m venv .venv
     .venv\\Scripts\\pip install -r requirements.txt
     .venv\\Scripts\\python main.py
 
-Controls: hold RMB to orbit, RMB+WASD to move, scroll to zoom, MMB to pan.
+Cameras: [1] free look  [2] turret  [3] missile  [4] follow jet
+Free look: hold RMB to orbit, RMB+WASD to move, scroll to zoom, MMB to pan.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ from ursina import (
     Vec3,
     camera,
     color,
+    lerp_angle,
+    lerp_exponential_decay,
+    scene,
     time,
     window,
 )
@@ -148,6 +152,7 @@ class AircraftCarrier(Entity):
             position=(4.4, 8.4, 6),
             color=color.rgb32(58, 64, 72),
         )
+        self.turret_hardpoint = Entity(parent=self, position=(4.4, 12.2, 6))
 
 
 class FighterJet(Entity):
@@ -357,6 +362,171 @@ class PredictedPath(Entity):
         self.pred_label.text = f"PRED  T+{self.lookahead:.1f}s"
 
 
+class CameraDirector(Entity):
+    """Toggles free-look, turret, missile, and auto-follow POVs."""
+
+    FREE = "free"
+    TURRET = "turret"
+    MISSILE = "missile"
+    FOLLOW = "follow"
+
+    _labels = {
+        FREE: "FREE LOOK",
+        TURRET: "AA TURRET",
+        MISSILE: "MISSILE",
+        FOLLOW: "FOLLOW TGT",
+    }
+    _fov = {
+        FREE: 55,
+        TURRET: 55,
+        MISSILE: 70,
+        FOLLOW: 60,
+    }
+    _base_pivot_height = 6
+    _base_pitch = 18
+
+    def __init__(self, editor: EditorCamera, target: Entity, turret_anchor: Entity, **kwargs):
+        super().__init__(**kwargs)
+        self.editor = editor
+        self.target = target
+        self.turret_anchor = turret_anchor
+        self.missile = None
+        self.mode = self.FREE
+        self._aim = Entity(add_to_scene_entities=False)
+
+        self.status = Text(
+            text="",
+            origin=(0.5, 0.5),
+            position=window.top_right + Vec2(-0.03, -0.03),
+            color=PHOSPHOR,
+            scale=0.85,
+            font=Text.default_monospace_font,
+        )
+        self.hint = Text(
+            text="[1] FREE   [2] TURRET   [3] MISSILE   [4] FOLLOW",
+            origin=(0.5, 0.5),
+            position=window.top_right + Vec2(-0.03, -0.07),
+            color=color.rgb32(0, 140, 72),
+            scale=0.7,
+            font=Text.default_monospace_font,
+        )
+        self._refresh_status()
+
+    def attach_missile(self, missile: Entity | None) -> None:
+        self.missile = missile
+
+    def input(self, key):
+        binds = {"1": self.FREE, "2": self.TURRET, "3": self.MISSILE, "4": self.FOLLOW}
+        if key in binds:
+            self.set_mode(binds[key])
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        camera.fov = self._fov[mode]
+        if mode in (self.FREE, self.TURRET):
+            self.editor.target_fov = self._fov[mode]
+            self.editor.enabled = True
+        else:
+            if self.editor.enabled:
+                self.editor.enabled = False
+            camera.world_parent = scene
+            camera.rotation_z = 0
+            if mode == self.FOLLOW:
+                camera.world_position = self._follow_point()
+                camera.look_at(self.target.world_position)
+            elif mode == self.MISSILE:
+                if self._missile_live():
+                    camera.world_position = self._missile_point()
+                    camera.look_at(self._missile_look())
+                else:
+                    camera.world_position = self.turret_anchor.world_position
+                    camera.look_at(self.target.world_position)
+        self._refresh_status()
+
+    def _missile_live(self) -> bool:
+        return bool(self.missile and getattr(self.missile, "enabled", True))
+
+    def _horizontal_forward(self, entity: Entity) -> Vec3:
+        vel = Vec3(getattr(entity, "velocity", Vec3(0, 0, 0)))
+        horizontal = Vec3(vel.x, 0, vel.z)
+        if horizontal.length() > 0.1:
+            return horizontal.normalized()
+        fwd = Vec3(entity.forward.x, 0, entity.forward.z)
+        if fwd.length() > 0.1:
+            return fwd.normalized()
+        return Vec3(0, 0, 1)
+
+    def _base_pivot(self) -> Vec3:
+        origin = Vec3(0, 0, 0)
+        if self.turret_anchor.parent:
+            origin = Vec3(self.turret_anchor.parent.world_position)
+        return origin + Vec3(0, self._base_pivot_height, 0)
+
+    def _pan_editor_toward_target(self, decay: float = 4.5) -> None:
+        """Orbit the carrier as if RMB were held and dragged toward the jet."""
+        self.editor.position = lerp_exponential_decay(
+            self.editor.position, self._base_pivot(), time.dt, 5
+        )
+        self._aim.world_position = self.editor.world_position
+        self._aim.look_at(self.target.world_position)
+        t = 1 - math.exp(-decay * time.dt)
+        self.editor.rotation_y = lerp_angle(self.editor.rotation_y, self._aim.rotation_y, t)
+        self.editor.rotation_x = lerp_angle(self.editor.rotation_x, self._base_pitch, t * 0.35)
+        self.editor.rotation_z = 0
+
+    def _follow_point(self) -> Vec3:
+        fwd = self._horizontal_forward(self.target)
+        return self.target.world_position - fwd * 26 + Vec3(0, 11, 0)
+
+    def _missile_point(self) -> Vec3:
+        missile = self.missile
+        return missile.world_position + missile.back * 8 + missile.up * 2
+
+    def _missile_look(self) -> Vec3:
+        missile = self.missile
+        vel = Vec3(getattr(missile, "velocity", Vec3(0, 0, 0)))
+        if vel.length() > 0.1:
+            return missile.world_position + vel.normalized() * 40
+        return missile.world_position + missile.forward * 40
+
+    def _aim_at(self, world_pos: Vec3, decay: float = 8.0) -> None:
+        self._aim.world_position = camera.world_position
+        self._aim.look_at(world_pos)
+        t = 1 - math.exp(-decay * time.dt)
+        camera.rotation_x = lerp_angle(camera.rotation_x, self._aim.rotation_x, t)
+        camera.rotation_y = lerp_angle(camera.rotation_y, self._aim.rotation_y, t)
+        camera.rotation_z = 0
+
+    def _refresh_status(self) -> None:
+        extra = ""
+        if self.mode == self.MISSILE and not self._missile_live():
+            extra = "\nAWAITING LAUNCH"
+        self.status.text = f"CAM  {self._labels[self.mode]}{extra}"
+
+    def update(self):
+        if self.mode == self.FREE:
+            return
+        if self.mode == self.TURRET:
+            self._pan_editor_toward_target()
+            return
+        if self.mode == self.FOLLOW:
+            camera.world_position = lerp_exponential_decay(
+                camera.world_position, self._follow_point(), time.dt, 6
+            )
+            self._aim_at(self.target.world_position, decay=10)
+            return
+        if self.mode == self.MISSILE:
+            if self._missile_live():
+                camera.world_position = lerp_exponential_decay(
+                    camera.world_position, self._missile_point(), time.dt, 10
+                )
+                self._aim_at(self._missile_look(), decay=12)
+            else:
+                camera.world_position = self.turret_anchor.world_position
+                self._aim_at(self.target.world_position, decay=7)
+            self._refresh_status()
+
+
 def build_environment() -> None:
     Entity(model="plane", scale=420, color=color.rgb32(5, 10, 16), y=0)
     Entity(
@@ -379,7 +549,7 @@ def build_hud() -> None:
         font=Text.default_monospace_font,
     )
     Text(
-        text="STEP 2  TARGET LOCK / PREDICTED VECTOR",
+        text="STEP 3  CAMERA POV",
         origin=(-0.5, 0.5),
         position=window.top_left + Vec2(0.03, -0.07),
         color=color.rgb32(0, 140, 72),
@@ -408,7 +578,7 @@ def main() -> None:
     window.color = color.rgb32(4, 8, 12)
 
     build_environment()
-    AircraftCarrier()
+    carrier = AircraftCarrier()
     jet = FighterJet()
     TrackingBox(jet)
     PredictedPath(jet)
@@ -422,6 +592,7 @@ def main() -> None:
     camera.clip_plane_far = 800
     camera.z = -78
     editor.target_z = -78
+    CameraDirector(editor=editor, target=jet, turret_anchor=carrier.turret_hardpoint)
 
     app.run()
 
