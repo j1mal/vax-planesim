@@ -1,6 +1,6 @@
 """
-VAX PlaneSim — Step 1
-Environment, circling fighter, and a Palantir-style lock-on box.
+VAX PlaneSim — Step 2
+Environment, circling fighter, lock-on box, and predicted velocity vector.
 
 Python 3.12 recommended (Panda3D wheels):
     py -3.12 -m venv .venv
@@ -83,6 +83,19 @@ def corner_bracket_mesh(arm: float = 0.22) -> Mesh:
                     verts.extend((origin, origin + delta))
                     edges.append((i, i + 1))
     return Mesh(vertices=verts, triangles=edges, mode="line", thickness=2, static=True)
+
+
+def axis_cross_mesh(size: float = 0.7) -> Mesh:
+    s = size
+    verts = [
+        Vec3(-s, 0, 0),
+        Vec3(s, 0, 0),
+        Vec3(0, -s, 0),
+        Vec3(0, s, 0),
+        Vec3(0, 0, -s),
+        Vec3(0, 0, s),
+    ]
+    return Mesh(vertices=verts, triangles=((0, 1), (2, 3), (4, 5)), mode="line", thickness=2, static=True)
 
 
 class AircraftCarrier(Entity):
@@ -264,6 +277,86 @@ class TrackingBox(Entity):
         )
 
 
+class PredictedPath(Entity):
+    """Linear lead vector from the target's instantaneous velocity."""
+
+    def __init__(self, target: FighterJet, lookahead: float = 6.0, dashes: int = 12, **kwargs):
+        super().__init__(unlit=True, **kwargs)
+        self.target = target
+        self.lookahead = lookahead
+        self.dashes = dashes
+
+        self.vector_line = Entity(
+            parent=self,
+            model=Mesh(
+                vertices=[Vec3(0, 0, 0), Vec3(0, 0, 1)],
+                triangles=[(0, 1)],
+                mode="line",
+                thickness=2,
+                static=False,
+            ),
+            color=PHOSPHOR,
+            unlit=True,
+        )
+        self.marker = Entity(
+            parent=self,
+            model=axis_cross_mesh(),
+            color=PHOSPHOR,
+            unlit=True,
+        )
+        self.pred_label = Text(
+            text="",
+            color=PHOSPHOR_DIM,
+            scale=0.7,
+            origin=(-0.5, 0.5),
+            font=Text.default_monospace_font,
+        )
+
+    def update(self):
+        origin = Vec3(self.target.world_position)
+        vel = Vec3(self.target.velocity)
+        speed = vel.length()
+        if speed < 0.05:
+            self.vector_line.enabled = False
+            self.marker.enabled = False
+            self.pred_label.enabled = False
+            return
+
+        direction = vel / speed
+        lock_depth = getattr(self.target, "lock_size", Vec3(0, 0, 2)).z * 0.55
+        start = origin + direction * lock_depth
+        end = origin + vel * self.lookahead
+        span = end - start
+
+        verts: list[Vec3] = []
+        tris: list[tuple[int, int]] = []
+        filled = 0.62
+        for i in range(self.dashes):
+            t0 = i / self.dashes
+            t1 = min(1.0, t0 + (1.0 / self.dashes) * filled)
+            idx = len(verts)
+            verts.extend((start + span * t0, start + span * t1))
+            tris.append((idx, idx + 1))
+
+        mesh = self.vector_line.model
+        mesh.vertices = verts
+        mesh.triangles = tris
+        mesh.generate()
+
+        self.vector_line.enabled = True
+        self.marker.enabled = True
+        self.marker.position = end
+
+        to_marker = end - camera.world_position
+        visible = camera.forward.dot(to_marker) > 0
+        self.pred_label.enabled = visible
+        if not visible:
+            return
+        screen = self.marker.screen_position
+        self.pred_label.position = Vec2(screen.x + 0.025, screen.y + 0.03)
+        self.pred_label.text = f"PRED  T+{self.lookahead:.1f}s"
+
+
 def build_environment() -> None:
     Entity(model="plane", scale=420, color=color.rgb32(5, 10, 16), y=0)
     Entity(
@@ -286,7 +379,7 @@ def build_hud() -> None:
         font=Text.default_monospace_font,
     )
     Text(
-        text="STEP 1  ENVIRONMENT / TARGET LOCK",
+        text="STEP 2  TARGET LOCK / PREDICTED VECTOR",
         origin=(-0.5, 0.5),
         position=window.top_left + Vec2(0.03, -0.07),
         color=color.rgb32(0, 140, 72),
@@ -318,6 +411,7 @@ def main() -> None:
     AircraftCarrier()
     jet = FighterJet()
     TrackingBox(jet)
+    PredictedPath(jet)
     build_hud()
 
     editor = EditorCamera(move_speed=25)
