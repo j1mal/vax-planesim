@@ -1,6 +1,6 @@
 """
-VAX PlaneSim — Step 3
-Environment, lock-on box, predicted vector, and camera POV modes.
+VAX PlaneSim — Step 4
+AA defense: intercept solution, PN-guided missile, existing track/camera systems.
 
 Python 3.12 recommended (Panda3D wheels):
     py -3.12 -m venv .venv
@@ -8,6 +8,7 @@ Python 3.12 recommended (Panda3D wheels):
     .venv\\Scripts\\python main.py
 
 Cameras: [1] free look  [2] turret  [3] missile  [4] follow jet
+AA: [G] engage/standby   [F] fire
 Free look: hold RMB to orbit, RMB+WASD to move, scroll to zoom, MMB to pan.
 """
 
@@ -26,6 +27,8 @@ from ursina import (
     Vec3,
     camera,
     color,
+    destroy,
+    lerp,
     lerp_angle,
     lerp_exponential_decay,
     scene,
@@ -36,6 +39,8 @@ from ursina import (
 
 PHOSPHOR = color.rgb32(0, 255, 92)
 PHOSPHOR_DIM = color.rgba32(0, 255, 92, 90)
+AMBER = color.rgb32(255, 196, 64)
+AMBER_DIM = color.rgba32(255, 196, 64, 110)
 HULL = color.rgb32(26, 30, 36)
 HULL_LIGHT = color.rgb32(40, 46, 54)
 DECK = color.rgb32(18, 22, 28)
@@ -102,6 +107,44 @@ def axis_cross_mesh(size: float = 0.7) -> Mesh:
     return Mesh(vertices=verts, triangles=((0, 1), (2, 3), (4, 5)), mode="line", thickness=2, static=True)
 
 
+def solve_intercept(
+    shooter_pos: Vec3,
+    missile_speed: float,
+    target_pos: Vec3,
+    target_vel: Vec3,
+) -> tuple[Vec3 | None, float | None]:
+    """Linear lead: first positive time where a constant-speed shot meets the target."""
+    r = target_pos - shooter_pos
+    a = target_vel.dot(target_vel) - missile_speed * missile_speed
+    b = 2.0 * r.dot(target_vel)
+    c = r.dot(r)
+
+    def _point(t: float) -> Vec3:
+        return target_pos + target_vel * t
+
+    if abs(a) < 1e-6:
+        if abs(b) < 1e-6:
+            t = r.length() / max(missile_speed, 0.1)
+            return _point(t), t
+        t = -c / b
+        if t > 0.05:
+            return _point(t), t
+        return None, None
+
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        t = r.length() / max(missile_speed, 0.1)
+        return _point(t), t
+
+    root = math.sqrt(disc)
+    candidates = [t for t in ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a)) if t > 0.05]
+    if not candidates:
+        t = r.length() / max(missile_speed, 0.1)
+        return _point(t), t
+    t = min(candidates)
+    return _point(t), t
+
+
 class AircraftCarrier(Entity):
     """Simple block carrier sitting on the waterline."""
 
@@ -153,6 +196,12 @@ class AircraftCarrier(Entity):
             color=color.rgb32(58, 64, 72),
         )
         self.turret_hardpoint = Entity(parent=self, position=(4.4, 12.2, 6))
+        Entity(
+            parent=self.turret_hardpoint,
+            model="cube",
+            scale=(1.4, 0.55, 2.2),
+            color=HULL_LIGHT,
+        )
 
 
 class FighterJet(Entity):
@@ -285,7 +334,7 @@ class TrackingBox(Entity):
 class PredictedPath(Entity):
     """Linear lead vector from the target's instantaneous velocity."""
 
-    def __init__(self, target: FighterJet, lookahead: float = 6.0, dashes: int = 12, **kwargs):
+    def __init__(self, target: FighterJet, lookahead: float = 3.0, dashes: int = 10, **kwargs):
         super().__init__(unlit=True, **kwargs)
         self.target = target
         self.lookahead = lookahead
@@ -527,6 +576,240 @@ class CameraDirector(Entity):
             self._refresh_status()
 
 
+class Missile(Entity):
+    """Constant-speed SAM steered with proportional navigation + linear lead."""
+
+    def __init__(
+        self,
+        origin: Entity,
+        target: Entity,
+        speed: float = 42.0,
+        navigation_gain: float = 4.0,
+        **kwargs,
+    ):
+        super().__init__(position=Vec3(origin.world_position), **kwargs)
+        self.target = target
+        self.speed = speed
+        self.N = navigation_gain
+        self.velocity = Vec3(0, 0, 0)
+        self.alive = True
+        self.age = 0.0
+        self.max_age = 14.0
+        self.hit_radius = 4.0
+        self.on_splash = None
+
+        Entity(parent=self, model="cube", scale=(0.28, 0.28, 2.4), color=HULL_LIGHT)
+        Entity(
+            parent=self,
+            model="cube",
+            scale=(0.2, 0.2, 0.55),
+            position=(0, 0, 1.35),
+            color=PHOSPHOR,
+            unlit=True,
+        )
+        Entity(
+            parent=self,
+            model="cube",
+            scale=(0.9, 0.08, 0.45),
+            position=(0, 0, -0.7),
+            color=HULL,
+        )
+        Entity(
+            parent=self,
+            model="cube",
+            scale=(0.08, 0.7, 0.4),
+            position=(0, 0, -0.7),
+            color=HULL,
+        )
+
+        intercept, _ = solve_intercept(
+            self.world_position, self.speed, target.world_position, Vec3(target.velocity)
+        )
+        if intercept is not None:
+            direction = intercept - self.world_position
+        else:
+            direction = target.world_position - self.world_position
+        if direction.length() < 0.1:
+            direction = Vec3(0, 1, 0)
+        self.velocity = direction.normalized() * self.speed
+        self.look_at(self.world_position + self.velocity)
+
+    def _steer(self, dt: float) -> bool:
+        target_pos = self.target.world_position
+        target_vel = Vec3(self.target.velocity)
+        r = target_pos - self.world_position
+        dist = r.length()
+        if dist < self.hit_radius:
+            return True
+        r_hat = r / dist
+        rel_vel = target_vel - self.velocity
+        omega = r.cross(rel_vel) / (dist * dist)
+        closing = -rel_vel.dot(r_hat)
+        accel = omega.cross(r_hat) * (self.N * max(closing, 0.0))
+
+        intercept, _ = solve_intercept(self.world_position, self.speed, target_pos, target_vel)
+        if intercept is not None:
+            to_int = intercept - self.world_position
+            if to_int.length() > 0.1:
+                desired = to_int.normalized() * self.speed
+                self.velocity = lerp(self.velocity, desired, min(1.0, 5.5 * dt))
+
+        self.velocity += accel * dt
+        if self.velocity.length() < 0.05:
+            self.velocity = r_hat * self.speed
+        else:
+            self.velocity = self.velocity.normalized() * self.speed
+        return False
+
+    def _splash(self, hit: bool) -> None:
+        self.alive = False
+        callback = self.on_splash
+        self.on_splash = None
+        if callback:
+            callback(hit)
+        destroy(self)
+
+    def update(self):
+        if not self.alive:
+            return
+        dt = max(time.dt, 1e-5)
+        self.age += dt
+        hit = self._steer(dt)
+        if hit or self.age > self.max_age or self.y < 0.4:
+            self._splash(hit=hit)
+            return
+        self.position += self.velocity * dt
+        self.look_at(self.world_position + self.velocity)
+
+
+class DefenseSystem(Entity):
+    """Carrier AA: toggleable intercept solution and manual missile launch."""
+
+    def __init__(self, carrier: AircraftCarrier, target: Entity, camera_director: CameraDirector, **kwargs):
+        super().__init__(**kwargs)
+        self.carrier = carrier
+        self.target = target
+        self.camera_director = camera_director
+        self.launch_origin = carrier.turret_hardpoint
+        self.missile_speed = 42.0
+        self.engaged = False
+        self.missile = None
+        self.cooldown = 0.0
+        self.last_hit = None
+        self.status_hold = 0.0
+
+        self.solution_line = Entity(
+            model=Mesh(
+                vertices=[Vec3(0, 0, 0), Vec3(0, 0, 1)],
+                triangles=[(0, 1)],
+                mode="line",
+                thickness=2,
+                static=False,
+            ),
+            color=AMBER,
+            unlit=True,
+            enabled=False,
+        )
+        self.solution_marker = Entity(
+            model=axis_cross_mesh(0.85),
+            color=AMBER,
+            unlit=True,
+            enabled=False,
+        )
+        self.int_label = Text(
+            text="",
+            color=AMBER,
+            scale=0.7,
+            origin=(-0.5, 0.5),
+            font=Text.default_monospace_font,
+            enabled=False,
+        )
+        self.status = Text(
+            text="",
+            origin=(-0.5, -0.5),
+            position=window.bottom_left + Vec2(0.03, 0.03),
+            color=PHOSPHOR,
+            scale=0.75,
+            font=Text.default_monospace_font,
+        )
+        self._refresh_status()
+
+    def input(self, key):
+        if key == "g":
+            self.engaged = not self.engaged
+            self._refresh_status()
+        elif key == "f":
+            self.fire()
+
+    def fire(self) -> None:
+        if self.cooldown > 0:
+            return
+        if self.missile and getattr(self.missile, "alive", False):
+            old = self.missile
+            old.on_splash = None
+            old.alive = False
+            destroy(old)
+        missile = Missile(self.launch_origin, self.target, speed=self.missile_speed)
+        missile.on_splash = self._on_splash
+        self.missile = missile
+        self.camera_director.attach_missile(missile)
+        self.cooldown = 1.25
+        self.last_hit = None
+        self.status_hold = 0.0
+        self._refresh_status()
+
+    def _on_splash(self, hit: bool) -> None:
+        self.missile = None
+        self.camera_director.attach_missile(None)
+        self.last_hit = hit
+        self.status_hold = 2.4
+        self._refresh_status()
+
+    def _solution_origin(self) -> Vec3:
+        if self.missile and getattr(self.missile, "alive", False):
+            return Vec3(self.missile.world_position)
+        return Vec3(self.launch_origin.world_position)
+
+    def _refresh_status(self, intercept: Vec3 | None = None, tti: float | None = None) -> None:
+        state = "ENGAGED" if self.engaged else "STANDBY"
+        lines = [f"AA  {state}", "[G] TOGGLE   [F] FIRE"]
+        if tti is not None:
+            lines.insert(1, f"INT T+{tti:4.1f}s")
+        if self.status_hold > 0 and self.last_hit is not None:
+            lines.insert(1, "MSL  SPLASH" if self.last_hit else "MSL  MISS")
+        elif self.missile and getattr(self.missile, "alive", False):
+            lines.insert(1, "MSL  IN FLIGHT")
+        self.status.text = "\n".join(lines)
+
+    def update(self):
+        dt = time.dt
+        self.cooldown = max(0.0, self.cooldown - dt)
+        self.status_hold = max(0.0, self.status_hold - dt)
+
+        origin = self._solution_origin()
+        intercept, tti = solve_intercept(
+            origin, self.missile_speed, self.target.world_position, Vec3(self.target.velocity)
+        )
+        show = self.engaged and intercept is not None and tti is not None
+        self.solution_line.enabled = show
+        self.solution_marker.enabled = show
+        self.int_label.enabled = False
+        if show:
+            self.solution_marker.position = intercept
+            mesh = self.solution_line.model
+            mesh.vertices = [origin, intercept]
+            mesh.triangles = [(0, 1)]
+            mesh.generate()
+            to_marker = intercept - camera.world_position
+            visible = camera.forward.dot(to_marker) > 0
+            self.int_label.enabled = visible
+            if visible:
+                screen = self.solution_marker.screen_position
+                self.int_label.position = Vec2(screen.x + 0.025, screen.y - 0.04)
+                self.int_label.text = f"INT  T+{tti:.1f}s"
+        self._refresh_status(intercept if show else None, tti if show else None)
+
+
 def build_environment() -> None:
     Entity(model="plane", scale=420, color=color.rgb32(5, 10, 16), y=0)
     Entity(
@@ -549,7 +832,7 @@ def build_hud() -> None:
         font=Text.default_monospace_font,
     )
     Text(
-        text="STEP 3  CAMERA POV",
+        text="STEP 4  AA DEFENSE / INTERCEPT",
         origin=(-0.5, 0.5),
         position=window.top_left + Vec2(0.03, -0.07),
         color=color.rgb32(0, 140, 72),
@@ -557,7 +840,7 @@ def build_hud() -> None:
         font=Text.default_monospace_font,
     )
     Text(
-        text="RMB orbit   RMB+WASD move   scroll zoom   MMB pan",
+        text="[G] AA   [F] fire   RMB orbit   WASD   scroll   MMB",
         origin=(0.5, -0.5),
         position=window.bottom_right + Vec2(-0.03, 0.03),
         color=color.rgb32(0, 110, 60),
@@ -592,7 +875,8 @@ def main() -> None:
     camera.clip_plane_far = 800
     camera.z = -78
     editor.target_z = -78
-    CameraDirector(editor=editor, target=jet, turret_anchor=carrier.turret_hardpoint)
+    director = CameraDirector(editor=editor, target=jet, turret_anchor=carrier.turret_hardpoint)
+    DefenseSystem(carrier, jet, director)
 
     app.run()
 
